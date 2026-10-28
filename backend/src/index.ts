@@ -253,6 +253,33 @@ app.post('/leads/bulk', async (req: Request, res: Response) => {
   }
 })
 
+// Upper bound for a single verification, covering all activity retries.
+const VERIFY_EMAIL_TIMEOUT = '15 seconds'
+
+let temporalClientPromise: Promise<Client> | undefined
+
+function getTemporalClient(): Promise<Client> {
+  if (!temporalClientPromise) {
+    temporalClientPromise = Connection.connect({ address: 'localhost:7233' })
+      .then((connection) => new Client({ connection, namespace: 'default' }))
+      .catch((error) => {
+        temporalClientPromise = undefined
+        throw error
+      })
+  }
+  return temporalClientPromise
+}
+
+// Temporal wraps failures (WorkflowFailedError -> ActivityFailure -> TimeoutFailure),
+// so surface the innermost message, e.g. "Activity task timed out".
+function getRootErrorMessage(error: unknown): string {
+  let current = error
+  while (current instanceof Error && (current as { cause?: unknown }).cause instanceof Error) {
+    current = (current as { cause?: unknown }).cause
+  }
+  return current instanceof Error ? current.message : 'Unknown error'
+}
+
 app.post('/leads/verify-emails', async (req: Request, res: Response) => {
   if (!req.body || typeof req.body !== 'object') {
     return res.status(400).json({ error: 'Request body is required and must be valid JSON' })
@@ -273,18 +300,15 @@ app.post('/leads/verify-emails', async (req: Request, res: Response) => {
       return res.status(404).json({ error: 'No leads found with the provided IDs' })
     }
 
-    const connection = await Connection.connect({ address: 'localhost:7233' })
-    const client = new Client({ connection, namespace: 'default' })
+    const client = await getTemporalClient()
 
-    let verifiedCount = 0
-    const results: Array<{ leadId: number; emailVerified: boolean }> = []
-    const errors: Array<{ leadId: number; leadName: string; error: string }> = []
-
-    for (const lead of leads) {
-      try {
+    // Verify all leads in parallel so one slow verification can't block the rest of the batch.
+    const outcomes = await Promise.allSettled(
+      leads.map(async (lead) => {
         const isVerified = await client.workflow.execute(verifyEmailWorkflow, {
           taskQueue: 'myQueue',
           workflowId: `verify-email-${lead.id}-${Date.now()}`,
+          workflowExecutionTimeout: VERIFY_EMAIL_TIMEOUT,
           args: [lead.email],
         })
 
@@ -293,18 +317,28 @@ app.post('/leads/verify-emails', async (req: Request, res: Response) => {
           data: { emailVerified: Boolean(isVerified) },
         })
 
-        results.push({ leadId: lead.id, emailVerified: isVerified })
-        verifiedCount += 1
-      } catch (error) {
+        return isVerified
+      })
+    )
+
+    const results: Array<{ leadId: number; emailVerified: boolean }> = []
+    const errors: Array<{ leadId: number; leadName: string; error: string }> = []
+
+    outcomes.forEach((outcome, index) => {
+      const lead = leads[index]
+      if (outcome.status === 'fulfilled') {
+        results.push({ leadId: lead.id, emailVerified: outcome.value })
+      } else {
+        console.error(`Error verifying email for lead ${lead.id}:`, outcome.reason)
         errors.push({
           leadId: lead.id,
           leadName: `${lead.firstName} ${lead.lastName}`.trim(),
-          error: error instanceof Error ? error.message : 'Unknown error',
+          error: getRootErrorMessage(outcome.reason),
         })
       }
-    }
+    })
 
-    await connection.close()
+    const verifiedCount = results.length
 
     res.json({ success: true, verifiedCount, results, errors })
   } catch (error) {
