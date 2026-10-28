@@ -40,7 +40,8 @@ export const LeadsList: FC = () => {
   const verifyEmailsMutation = useMutation({
     mutationFn: async (ids: number[]) => api.leads.verifyEmails({ leadIds: ids }),
     onMutate: () => {
-      toast.loading('Verifying emails...', { id: VERIFY_EMAILS_TOAST_ID })
+      // Override the global 4s duration so the toast stays until the request settles.
+      toast.loading('Verifying emails...', { id: VERIFY_EMAILS_TOAST_ID, duration: Infinity })
     },
     onSettled: () => {
       toast.dismiss(VERIFY_EMAILS_TOAST_ID)
