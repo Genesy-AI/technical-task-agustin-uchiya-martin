@@ -1,8 +1,8 @@
 import { PrismaClient } from '@prisma/client'
 import express, { Request, Response } from 'express'
 import { Connection, Client } from '@temporalio/client'
-import { verifyEmailWorkflow } from './workflows'
 import { generateMessageFromTemplate } from './utils/messageGenerator'
+import { parseLeadIds, verifyLeadEmails } from './utils/verifyEmails'
 import { runTemporalWorker } from './worker'
 const prisma = new PrismaClient()
 const app = express()
@@ -253,9 +253,6 @@ app.post('/leads/bulk', async (req: Request, res: Response) => {
   }
 })
 
-// Upper bound for a single verification, covering all activity retries.
-const VERIFY_EMAIL_TIMEOUT = '15 seconds'
-
 let temporalClientPromise: Promise<Client> | undefined
 
 function getTemporalClient(): Promise<Client> {
@@ -270,77 +267,26 @@ function getTemporalClient(): Promise<Client> {
   return temporalClientPromise
 }
 
-// Temporal wraps failures (WorkflowFailedError -> ActivityFailure -> TimeoutFailure),
-// so surface the innermost message, e.g. "Activity task timed out".
-function getRootErrorMessage(error: unknown): string {
-  let current = error
-  while (current instanceof Error && (current as { cause?: unknown }).cause instanceof Error) {
-    current = (current as { cause?: unknown }).cause
-  }
-  return current instanceof Error ? current.message : 'Unknown error'
-}
-
 app.post('/leads/verify-emails', async (req: Request, res: Response) => {
   if (!req.body || typeof req.body !== 'object') {
     return res.status(400).json({ error: 'Request body is required and must be valid JSON' })
   }
 
-  const { leadIds } = req.body as { leadIds?: number[] }
+  const leadIds = parseLeadIds((req.body as { leadIds?: unknown }).leadIds)
 
-  if (!Array.isArray(leadIds) || leadIds.length === 0) {
-    return res.status(400).json({ error: 'leadIds must be a non-empty array' })
+  if (!leadIds) {
+    return res.status(400).json({ error: 'leadIds must be a non-empty array of positive integer IDs' })
   }
 
   try {
-    const leads = await prisma.lead.findMany({
-      where: { id: { in: leadIds.map((id) => Number(id)) } },
-    })
+    const client = await getTemporalClient()
+    const result = await verifyLeadEmails(leadIds, { prisma, workflowClient: client.workflow })
 
-    if (leads.length === 0) {
+    if (!result) {
       return res.status(404).json({ error: 'No leads found with the provided IDs' })
     }
 
-    const client = await getTemporalClient()
-
-    // Verify all leads in parallel so one slow verification can't block the rest of the batch.
-    const outcomes = await Promise.allSettled(
-      leads.map(async (lead) => {
-        const isVerified = await client.workflow.execute(verifyEmailWorkflow, {
-          taskQueue: 'myQueue',
-          workflowId: `verify-email-${lead.id}-${Date.now()}`,
-          workflowExecutionTimeout: VERIFY_EMAIL_TIMEOUT,
-          args: [lead.email],
-        })
-
-        await prisma.lead.update({
-          where: { id: lead.id },
-          data: { emailVerified: Boolean(isVerified) },
-        })
-
-        return isVerified
-      })
-    )
-
-    const results: Array<{ leadId: number; emailVerified: boolean }> = []
-    const errors: Array<{ leadId: number; leadName: string; error: string }> = []
-
-    outcomes.forEach((outcome, index) => {
-      const lead = leads[index]
-      if (outcome.status === 'fulfilled') {
-        results.push({ leadId: lead.id, emailVerified: outcome.value })
-      } else {
-        console.error(`Error verifying email for lead ${lead.id}:`, outcome.reason)
-        errors.push({
-          leadId: lead.id,
-          leadName: `${lead.firstName} ${lead.lastName}`.trim(),
-          error: getRootErrorMessage(outcome.reason),
-        })
-      }
-    })
-
-    const verifiedCount = results.length
-
-    res.json({ success: true, verifiedCount, results, errors })
+    res.json({ success: true, ...result })
   } catch (error) {
     console.error('Error verifying emails:', error)
     res.status(500).json({ error: 'Failed to verify emails' })

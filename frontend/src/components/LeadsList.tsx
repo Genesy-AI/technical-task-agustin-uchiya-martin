@@ -4,8 +4,12 @@ import toast from 'react-hot-toast'
 import { api } from '../api'
 import { MessageTemplateModal } from './MessageTemplateModal'
 import { CsvImportModal } from './CsvImportModal'
-
-const VERIFY_EMAILS_TOAST_ID = 'verify-emails'
+import {
+  dismissVerifyingEmailsToast,
+  showVerifyEmailsRequestErrorToast,
+  showVerifyEmailsResultToasts,
+  showVerifyingEmailsToast,
+} from '../utils/verifyEmailsToasts'
 
 export const LeadsList: FC = () => {
   const [selectedLeads, setSelectedLeads] = useState<number[]>([])
@@ -40,36 +44,19 @@ export const LeadsList: FC = () => {
   const verifyEmailsMutation = useMutation({
     mutationFn: async (ids: number[]) => api.leads.verifyEmails({ leadIds: ids }),
     onMutate: () => {
-      // Override the global 4s duration so the toast stays until the request settles.
-      toast.loading('Verifying emails...', { id: VERIFY_EMAILS_TOAST_ID, duration: Infinity })
+      showVerifyingEmailsToast()
     },
     onSettled: () => {
-      toast.dismiss(VERIFY_EMAILS_TOAST_ID)
-    },
-    onSuccess: (data) => {
+      dismissVerifyingEmailsToast()
+      // Refetch on errors too: the request may have saved some results before failing.
       queryClient.invalidateQueries({ queryKey: ['leads', 'getMany'] })
       setIsEnrichDropdownOpen(false)
-
-      if (data.verifiedCount > 0) {
-        toast.success(
-          data.verifiedCount === 1
-            ? `Verified ${data.verifiedCount} email`
-            : `Verified ${data.verifiedCount} emails`
-        )
-      }
-
-      if (data.errors.length > 0) {
-        const failedNames = data.errors.map((error) => error.leadName).join(', ')
-        toast.error(
-          data.errors.length === 1
-            ? `Could not verify 1 email: ${failedNames}`
-            : `Could not verify ${data.errors.length} emails: ${failedNames}`
-        )
-      }
+    },
+    onSuccess: (data) => {
+      showVerifyEmailsResultToasts(data)
     },
     onError: () => {
-      setIsEnrichDropdownOpen(false)
-      toast.error('Failed to verify emails. Please try again.')
+      showVerifyEmailsRequestErrorToast()
     },
   })
 
